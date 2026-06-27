@@ -28,7 +28,21 @@ const allowedOrigins = (process.env.CORS_ORIGINS || "")
   .filter(Boolean);
 
 function isOriginAllowed(origin) {
-  return !origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin);
+  if (!origin) return true;
+  if (allowedOrigins.includes(origin)) return true;
+
+  try {
+    const { hostname, protocol } = new URL(origin);
+    const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1";
+    const isCloudflareTunnel =
+      protocol === "https:" &&
+      (hostname === "trycloudflare.com" ||
+        hostname.endsWith(".trycloudflare.com"));
+
+    return isLocalhost || isCloudflareTunnel;
+  } catch {
+    return false;
+  }
 }
 
 const io = new Server(server, {
@@ -151,6 +165,16 @@ io.on("connection", (socket) => {
     }
 
     voiceRoomAudioPipeline.handleAudioChunk(socket, payload);
+  });
+
+  socket.on("voice-room:privacy-state", ({ roomId, participant, state }) => {
+    if (!roomId || !participant?.participantId || !state) return;
+
+    socket.to(`voice-room:${roomId}`).emit("voice-room:privacy-state", {
+      participant,
+      state,
+      updatedAt: new Date().toISOString(),
+    });
   });
 
   /*
@@ -832,6 +856,17 @@ function getPublicVoiceRoom(room) {
     isHost: participant.isHost,
     joinedAt: participant.joinedAt,
   })),
+    recentlyLeft: room.participants
+  .filter((participant) => participant.leftAt)
+  .slice(-8)
+  .map((participant) => ({
+    participantId: participant.participantId,
+    userId: participant.userId?.toString() || null,
+    name: participant.name,
+    isHost: participant.isHost,
+    joinedAt: participant.joinedAt,
+    leftAt: participant.leftAt,
+  })),
     transcript: room.transcript.map((line) => ({
       id: line._id?.toString() || `${line.createdAt}_${line.participantId}`,
       participantId: line.participantId,
@@ -876,7 +911,7 @@ app.post("/api/voice-rooms", authRequired, async (req, res) => {
           participantId: null,
           speakerName: "CALLBUDDY AI",
           speakerType: "system",
-          content: `${host.name} opened this Voice Room. Say “CallBuddy” when you want AI help.`,
+          content: `${host.name} opened this Voice Room. Turn on AI Mic when you want CallBuddy to listen and respond.`,
           createdAt: new Date(),
         },
       ],
@@ -1233,12 +1268,11 @@ console.log("=================================");
 You are CallBuddy AI inside a shared Voice Room.
 
 Rules:
-- Only reply because someone clearly called you by saying CallBuddy or Buddy.
+- Reply because AI Mic is enabled and the latest speech was sent to you.
 - Be friendly, short, and natural.
 - Usually reply in 1 to 3 sentences.
 - You are speaking to a group, so use the person's name when useful.
 - Never pretend you can hear raw audio; you receive only speech transcripts.
-- If people are chatting with each other and did not call you, stay silent.
 - You were created by Rishi as a college project.
             `,
           },

@@ -89,20 +89,35 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
   const [liveSpeech, setLiveSpeech] = useState("");
+  const [friendMicEnabled, setFriendMicEnabled] = useState(true);
+  const [aiSpeakerMode, setAiSpeakerMode] = useState("private");
+  const [privateTranscript, setPrivateTranscript] = useState([]);
+  const [privacyStates, setPrivacyStates] = useState({});
+  const [roomTimeline, setRoomTimeline] = useState([]);
+  const [isParticipantPanelOpen, setIsParticipantPanelOpen] = useState(false);
 
   const transcriptEndRef = useRef(null);
+  const transcriptListRef = useRef(null);
   const mediaRecorderRef = useRef(null);
   const recordingMimeTypeRef = useRef("");
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
   const silenceMonitorRef = useRef(null);
-  const pendingFinalChunkRef = useRef(false);
+  const segmentChunksRef = useRef([]);
+  const shouldUploadSegmentRef = useRef(false);
+  const segmentHadSpeechRef = useRef(false);
+  const segmentStartedAtRef = useRef(0);
+  const segmentRestartTimerRef = useRef(null);
+  const aiMicEnabledRef = useRef(false);
   const speechDetectedRef = useRef(false);
   const lastVoiceActivityRef = useRef(0);
   const lastFinalChunkAtRef = useRef(0);
   const socketRef = useRef(null);
   const lastSpokenAiMessageRef = useRef("");
   const localStreamRef = useRef(null);
+  const aiStreamRef = useRef(null);
+  const friendMicEnabledRef = useRef(true);
+  const aiSpeakerModeRef = useRef("private");
   const peerConnectionsRef = useRef(new Map());
   const remoteAudioContainerRef = useRef(null);
 
@@ -110,8 +125,8 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
   const isSpeakingRef = useRef(false);
   const isThinkingRef = useRef(false);
 
-  const lastProcessedSpeechRef = useRef("");
-  const lastProcessedAtRef = useRef(0);
+  const [isTranscriptAtBottom, setIsTranscriptAtBottom] = useState(true);
+  const [hasNewTranscript, setHasNewTranscript] = useState(false);
 
   const authHeaders = useMemo(() => {
     return token
@@ -126,6 +141,67 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
   useEffect(() => {
     participantRef.current = participant;
   }, [participant]);
+
+  useEffect(() => {
+    friendMicEnabledRef.current = friendMicEnabled;
+    localStreamRef.current
+      ?.getAudioTracks()
+      .forEach((track) => {
+        track.enabled = friendMicEnabled;
+      });
+  }, [friendMicEnabled]);
+
+  useEffect(() => {
+    aiSpeakerModeRef.current = aiSpeakerMode;
+  }, [aiSpeakerMode]);
+
+  const addTimelineEvent = (content) => {
+    setRoomTimeline((current) =>
+      [
+        ...current,
+        {
+          id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          content,
+          createdAt: new Date().toISOString(),
+        },
+      ].slice(-30)
+    );
+  };
+
+  const publishPrivacyState = useCallback(
+    (override = {}) => {
+      if (!roomId || !participantRef.current?.participantId) return;
+
+      const nextState = {
+        friendMicEnabled: friendMicEnabledRef.current,
+        aiMicEnabled: mediaRecorderRef.current?.state === "recording",
+        aiSpeakerMode: aiSpeakerModeRef.current,
+        aiMemoryEnabled: aiSpeakerModeRef.current === "shared",
+        aiStatus: isThinkingRef.current
+          ? "Thinking"
+          : isSpeakingRef.current
+          ? "Speaking"
+          : "Idle",
+        ...override,
+      };
+
+      setPrivacyStates((current) => ({
+        ...current,
+        [participantRef.current.participantId]: {
+          participant: participantRef.current,
+          state: nextState,
+          updatedAt: new Date().toISOString(),
+        },
+      }));
+
+      socketRef.current?.emit("voice-room:privacy-state", {
+        roomId,
+        participant: participantRef.current,
+        state: nextState,
+      });
+    },
+    [roomId]
+  );
 
   const closePeerConnection = (peerId) => {
     const peerConnection = peerConnectionsRef.current.get(peerId);
@@ -224,6 +300,10 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
         video: false,
       });
 
+      stream.getAudioTracks().forEach((track) => {
+        track.enabled = friendMicEnabledRef.current;
+      });
+
       localStreamRef.current = stream;
       return true;
     } catch (microphoneError) {
@@ -239,6 +319,34 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
     localStreamRef.current = null;
     [...peerConnectionsRef.current.keys()].forEach(closePeerConnection);
+  };
+
+  const startAiAudio = async () => {
+    if (aiStreamRef.current) return true;
+
+    try {
+      aiStreamRef.current = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+
+      return true;
+    } catch (microphoneError) {
+      console.error("AI microphone error:", microphoneError);
+      window.alert(
+        "Microphone access is needed for AI listening. Please allow it and try again."
+      );
+      return false;
+    }
+  };
+
+  const stopAiAudio = () => {
+    aiStreamRef.current?.getTracks().forEach((track) => track.stop());
+    aiStreamRef.current = null;
   };
 
   useEffect(() => {
@@ -263,6 +371,8 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
         roomId,
         participant,
       });
+
+      window.setTimeout(() => publishPrivacyState(), 0);
     });
 
     socket.on("webrtc:existing-peers", async ({ peerIds }) => {
@@ -329,6 +439,31 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
       }
     });
 
+    socket.on("voice-room:participant-joined", ({ participant: joined }) => {
+      if (joined?.name || joined?.participantName) {
+        addTimelineEvent(`${joined.name || joined.participantName} joined.`);
+      }
+    });
+
+    socket.on("voice-room:participant-left", ({ participant: left }) => {
+      if (left?.name || left?.participantName) {
+        addTimelineEvent(`${left.name || left.participantName} left.`);
+      }
+    });
+
+    socket.on("voice-room:privacy-state", ({ participant: stateParticipant, state, updatedAt }) => {
+      if (!stateParticipant?.participantId || !state) return;
+
+      setPrivacyStates((current) => ({
+        ...current,
+        [stateParticipant.participantId]: {
+          participant: stateParticipant,
+          state,
+          updatedAt,
+        },
+      }));
+    });
+
     socket.on("voice-room:updated", ({ room: updatedRoom, event }) => {
       setRoom(updatedRoom);
 
@@ -349,9 +484,13 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
       }
     });
 
-    socket.on("voice-room:transcript", ({ room: updatedRoom }) => {
+    socket.on("voice-room:transcript", ({ line, room: updatedRoom, visibility }) => {
       if (updatedRoom) {
         setRoom(updatedRoom);
+      }
+
+      if (visibility === "private" && line) {
+        setPrivateTranscript((current) => [...current, line].slice(-60));
       }
 
       setLiveSpeech("");
@@ -366,9 +505,13 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
       setStatus("CALLBUDDY THINKING");
     });
 
-    socket.on("voice-room:ai-response", ({ line, room: updatedRoom }) => {
+    socket.on("voice-room:ai-response", ({ line, room: updatedRoom, visibility }) => {
       if (updatedRoom) {
         setRoom(updatedRoom);
+      }
+
+      if (visibility === "private" && line) {
+        setPrivateTranscript((current) => [...current, line].slice(-60));
       }
 
       setIsThinking(false);
@@ -396,6 +539,7 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
 
       mediaRecorderRef.current?.stop();
       stopSilenceMonitor();
+      stopAiAudio();
       stopLiveAudio();
 
       if ("speechSynthesis" in window) {
@@ -420,6 +564,7 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
       });
 
       stopLiveAudio();
+      stopAiAudio();
       socket.disconnect();
 
       if (socketRef.current === socket) {
@@ -428,11 +573,12 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
 
       mediaRecorderRef.current?.stop();
       stopSilenceMonitor();
+      stopAiAudio();
       if ("speechSynthesis" in window) {
         window.speechSynthesis.cancel();
       }
     };
-  }, [roomId, participant?.participantId]);
+  }, [roomId, participant?.participantId, publishPrivacyState]);
 
   useEffect(() => {
     isSpeakingRef.current = isSpeaking;
@@ -443,11 +589,46 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
   }, [isThinking]);
 
   useEffect(() => {
+    publishPrivacyState();
+  }, [friendMicEnabled, isListening, isThinking, isSpeaking, aiSpeakerMode, publishPrivacyState]);
+
+  useEffect(() => {
+    if (!isTranscriptAtBottom) {
+      if (visibleTranscript.length > 0) {
+        setHasNewTranscript(true);
+      }
+      return;
+    }
+
     transcriptEndRef.current?.scrollIntoView({
       behavior: "smooth",
       block: "end",
     });
-  }, [room?.transcript, liveSpeech, isListening, isSpeaking, isThinking]);
+  }, [room?.transcript, privateTranscript, liveSpeech, isListening, isSpeaking, isThinking, isTranscriptAtBottom]);
+
+  const handleTranscriptScroll = () => {
+    const element = transcriptListRef.current;
+    if (!element) return;
+
+    const distanceFromBottom =
+      element.scrollHeight - element.scrollTop - element.clientHeight;
+    const nearBottom = distanceFromBottom < 80;
+
+    setIsTranscriptAtBottom(nearBottom);
+
+    if (nearBottom) {
+      setHasNewTranscript(false);
+    }
+  };
+
+  const scrollTranscriptToBottom = () => {
+    setIsTranscriptAtBottom(true);
+    setHasNewTranscript(false);
+    transcriptEndRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "end",
+    });
+  };
 
   const loadRoom = useCallback(async () => {
     if (!roomId) {
@@ -584,6 +765,7 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
       window.clearInterval(refreshTimer);
       mediaRecorderRef.current?.stop();
       stopSilenceMonitor();
+      stopAiAudio();
 
       if ("speechSynthesis" in window) {
         window.speechSynthesis.cancel();
@@ -669,7 +851,7 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
   };
 
   
-  const emitAudioChunk = async (blob, isFinal = false) => {
+  const emitAudioSegment = async (blob) => {
     if (
       !blob?.size ||
       !roomId ||
@@ -687,11 +869,12 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
         roomId,
         participantId: participantRef.current.participantId,
         mimeType: recordingMimeTypeRef.current || blob.type || "audio/webm",
-        isFinal,
+        aiSpeakerMode: aiSpeakerModeRef.current,
+        isFinal: true,
         chunk,
       });
     } catch (chunkError) {
-      console.error("Could not upload audio chunk:", chunkError);
+      console.error("Could not upload audio segment:", chunkError);
       setStatus("VOICE ERROR");
     }
   };
@@ -702,11 +885,34 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
       silenceMonitorRef.current = null;
     }
 
+    if (segmentRestartTimerRef.current) {
+      window.clearTimeout(segmentRestartTimerRef.current);
+      segmentRestartTimerRef.current = null;
+    }
+
     audioContextRef.current?.close().catch(() => {});
     audioContextRef.current = null;
     analyserRef.current = null;
     speechDetectedRef.current = false;
     lastVoiceActivityRef.current = 0;
+  };
+
+  const stopCurrentAiSegment = (shouldUpload = false) => {
+    const recorder = mediaRecorderRef.current;
+
+    if (!recorder || recorder.state === "inactive") return;
+
+    shouldUploadSegmentRef.current = shouldUpload;
+    recorder.stop();
+  };
+
+  const scheduleNextAiSegment = () => {
+    if (!aiMicEnabledRef.current || segmentRestartTimerRef.current) return;
+
+    segmentRestartTimerRef.current = window.setTimeout(() => {
+      segmentRestartTimerRef.current = null;
+      startAiSegment();
+    }, 140);
   };
 
   const startSilenceMonitor = (stream, recorder) => {
@@ -719,12 +925,13 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
     const audioContext = new AudioContext();
     const analyser = audioContext.createAnalyser();
     const source = audioContext.createMediaStreamSource(stream);
-    const samples = new Uint8Array(analyser.fftSize);
 
     analyser.fftSize = 1024;
     source.connect(analyser);
     audioContextRef.current = audioContext;
     analyserRef.current = analyser;
+
+    const samples = new Uint8Array(analyser.fftSize);
 
     silenceMonitorRef.current = window.setInterval(() => {
       if (recorder.state !== "recording") return;
@@ -740,9 +947,11 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
 
       const volume = Math.sqrt(sum / samples.length);
       const now = Date.now();
+      const segmentAge = now - segmentStartedAtRef.current;
 
-      if (volume > 0.028) {
+      if (volume > 0.026) {
         speechDetectedRef.current = true;
+        segmentHadSpeechRef.current = true;
         lastVoiceActivityRef.current = now;
         return;
       }
@@ -750,23 +959,119 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
       const pausedLongEnough =
         speechDetectedRef.current &&
         lastVoiceActivityRef.current &&
-        now - lastVoiceActivityRef.current > 1400 &&
-        now - lastFinalChunkAtRef.current > 1600;
+        now - lastVoiceActivityRef.current > 1700 &&
+        now - lastFinalChunkAtRef.current > 1900 &&
+        segmentAge > 900;
 
-      if (pausedLongEnough) {
-        pendingFinalChunkRef.current = true;
+      const maxSegmentReached = segmentHadSpeechRef.current && segmentAge > 18000;
+
+      if (pausedLongEnough || maxSegmentReached) {
         lastFinalChunkAtRef.current = now;
         speechDetectedRef.current = false;
-        recorder.requestData();
+        stopCurrentAiSegment(true);
       }
     }, 180);
+  };
+
+  const startAiSegment = () => {
+    if (
+      !aiMicEnabledRef.current ||
+      !participantRef.current ||
+      !socketRef.current?.connected ||
+      !aiStreamRef.current ||
+      mediaRecorderRef.current?.state === "recording"
+    ) {
+      return;
+    }
+
+    try {
+      const mimeType = getSupportedAudioMimeType();
+      const recorder = new MediaRecorder(
+        aiStreamRef.current,
+        mimeType ? { mimeType } : undefined
+      );
+
+      recordingMimeTypeRef.current = mimeType || recorder.mimeType || "audio/webm";
+      segmentChunksRef.current = [];
+      shouldUploadSegmentRef.current = false;
+      segmentHadSpeechRef.current = false;
+      speechDetectedRef.current = false;
+      lastVoiceActivityRef.current = 0;
+      segmentStartedAtRef.current = Date.now();
+
+      recorder.onstart = () => {
+        setIsListening(true);
+        setLiveSpeech("");
+        setStatus("AI LISTENING");
+      };
+
+      recorder.ondataavailable = (event) => {
+        if (event.data?.size > 0) {
+          segmentChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onerror = (event) => {
+        console.error("MediaRecorder error:", event.error || event);
+        setStatus("VOICE ERROR");
+        stopSilenceMonitor();
+      };
+
+      recorder.onstop = () => {
+        stopSilenceMonitor();
+
+        const shouldUpload = shouldUploadSegmentRef.current && segmentHadSpeechRef.current;
+        const chunks = segmentChunksRef.current;
+        segmentChunksRef.current = [];
+        shouldUploadSegmentRef.current = false;
+
+        if (shouldUpload && chunks.length > 0) {
+          const voiceBlob = new Blob(chunks, {
+            type: recordingMimeTypeRef.current || recorder.mimeType || "audio/webm",
+          });
+          emitAudioSegment(voiceBlob);
+        }
+
+        if (aiMicEnabledRef.current) {
+          scheduleNextAiSegment();
+        } else {
+          mediaRecorderRef.current = null;
+          stopAiAudio();
+          setIsListening(false);
+          setLiveSpeech("");
+
+          if (
+            participantRef.current &&
+            !isSpeakingRef.current &&
+            !isThinkingRef.current
+          ) {
+            setStatus(
+              participantRef.current.isHost ? "HOST CONNECTED" : "CONNECTED"
+            );
+          }
+        }
+      };
+
+      mediaRecorderRef.current = recorder;
+      startSilenceMonitor(aiStreamRef.current, recorder);
+      recorder.start();
+    } catch (recordingError) {
+      console.error("Could not start AI segment recording:", recordingError);
+      aiMicEnabledRef.current = false;
+      setIsListening(false);
+      setLiveSpeech("");
+      setStatus("VOICE ERROR");
+      window.alert(
+        "Could not start AI listening. Please check microphone permission and try again."
+      );
+    }
   };
 
   const startRecording = async () => {
     if (
       !participantRef.current ||
       !socketRef.current?.connected ||
-      mediaRecorderRef.current?.state === "recording"
+      aiMicEnabledRef.current
     ) {
       return;
     }
@@ -778,101 +1083,53 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
       return;
     }
 
-    const audioReady = await startLiveAudio();
+    const audioReady = await startAiAudio();
 
-    if (!audioReady || !localStreamRef.current) {
+    if (!audioReady || !aiStreamRef.current) {
       setStatus("MICROPHONE BLOCKED");
       return;
     }
 
-    try {
-      const mimeType = getSupportedAudioMimeType();
-      const recorder = new MediaRecorder(
-        localStreamRef.current,
-        mimeType ? { mimeType } : undefined
-      );
-
-      recordingMimeTypeRef.current = mimeType || recorder.mimeType || "audio/webm";
-
-      recorder.onstart = () => {
-        setIsListening(true);
-        setLiveSpeech("");
-        setStatus("LISTENING");
-      };
-
-      recorder.ondataavailable = (event) => {
-        if (event.data?.size > 0 && participantRef.current) {
-          const isFinal =
-            pendingFinalChunkRef.current || recorder.state === "inactive";
-
-          pendingFinalChunkRef.current = false;
-          emitAudioChunk(event.data, isFinal);
-        }
-      };
-
-      recorder.onerror = (event) => {
-        console.error("MediaRecorder error:", event.error || event);
-        setStatus("VOICE ERROR");
-        setIsListening(false);
-        setLiveSpeech("");
-      };
-
-      recorder.onstop = () => {
-        stopSilenceMonitor();
-        setIsListening(false);
-        setLiveSpeech("");
-
-        if (
-          participantRef.current &&
-          !isSpeakingRef.current &&
-          !isThinkingRef.current
-        ) {
-          setStatus(
-            participantRef.current.isHost ? "HOST CONNECTED" : "CONNECTED"
-          );
-        }
-      };
-
-      mediaRecorderRef.current = recorder;
-      startSilenceMonitor(localStreamRef.current, recorder);
-      recorder.start(1000);
-    } catch (recordingError) {
-      console.error("Could not start server-side recording:", recordingError);
-      setIsListening(false);
-      setLiveSpeech("");
-      setStatus("VOICE ERROR");
-      window.alert(
-        "Could not start voice transcription. Please check microphone permission and try again."
-      );
-    }
+    aiMicEnabledRef.current = true;
+    setIsListening(true);
+    publishPrivacyState({ aiMicEnabled: true });
+    startAiSegment();
   };
 
   const stopRecording = () => {
-    const recorder = mediaRecorderRef.current;
+    aiMicEnabledRef.current = false;
 
-    if (recorder && recorder.state !== "inactive") {
-      pendingFinalChunkRef.current = true;
-      recorder.requestData();
-      recorder.stop();
+    if (segmentRestartTimerRef.current) {
+      window.clearTimeout(segmentRestartTimerRef.current);
+      segmentRestartTimerRef.current = null;
     }
 
-    mediaRecorderRef.current = null;
-    stopSilenceMonitor();
-    setIsListening(false);
-    setLiveSpeech("");
+    stopCurrentAiSegment(segmentHadSpeechRef.current);
 
-    if (
-      participantRef.current &&
-      !isSpeakingRef.current &&
-      !isThinkingRef.current
-    ) {
-      setStatus(
-        participantRef.current.isHost ? "HOST CONNECTED" : "CONNECTED"
-      );
+    if (!mediaRecorderRef.current || mediaRecorderRef.current.state === "inactive") {
+      mediaRecorderRef.current = null;
+      stopSilenceMonitor();
+      stopAiAudio();
+      setIsListening(false);
+      setLiveSpeech("");
     }
+
+    publishPrivacyState({ aiMicEnabled: false });
   };
 
- const toggleMicrophone = () => {
+ const toggleFriendMic = () => {
+  const nextValue = !friendMicEnabled;
+
+  setFriendMicEnabled(nextValue);
+  addTimelineEvent(
+    `${participantRef.current?.participantName || participantRef.current?.name || "You"} ${
+      nextValue ? "enabled" : "disabled"
+    } Friend Mic.`
+  );
+  publishPrivacyState({ friendMicEnabled: nextValue });
+};
+
+ const toggleAiMic = () => {
   if (
     !participant ||
     room?.status === "ended" ||
@@ -883,13 +1140,32 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
 
   if (isListening) {
     stopRecording();
+    addTimelineEvent(
+      `${participantRef.current?.participantName || participantRef.current?.name || "You"} disabled AI Mic.`
+    );
+    publishPrivacyState({ aiMicEnabled: false });
   } else {
     startRecording();
+    addTimelineEvent(
+      `${participantRef.current?.participantName || participantRef.current?.name || "You"} enabled AI Mic.`
+    );
+    publishPrivacyState({ aiMicEnabled: true });
   }
 };
 
+  const toggleAiSpeakerMode = () => {
+    const nextMode = aiSpeakerMode === "shared" ? "private" : "shared";
+
+    setAiSpeakerMode(nextMode);
+    addTimelineEvent(
+      `AI Speaker switched to ${nextMode === "shared" ? "Shared" : "Private"}.`
+    );
+    publishPrivacyState({ aiSpeakerMode: nextMode });
+  };
+
   const leaveRoom = async () => {
     stopRecording();
+    stopAiAudio();
     stopLiveAudio();
 
     if ("speechSynthesis" in window) {
@@ -984,6 +1260,17 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
   }
 
   const transcript = room?.transcript || [];
+  const visibleTranscript = [...transcript, ...privateTranscript];
+  const selfPrivacyState = {
+    friendMicEnabled,
+    aiMicEnabled: isListening,
+    aiSpeakerMode,
+    aiMemoryEnabled: aiSpeakerMode === "shared",
+    aiListening: isListening,
+    aiStatus: isThinking ? "Thinking" : isSpeaking ? "Speaking" : "Idle",
+  };
+  const participantRows = room?.participants || [];
+  const recentlyLeftRows = room?.recentlyLeft || [];
 
   if (endScreen) {
     const isHostEndScreen = endScreen === "host";
@@ -1119,7 +1406,7 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
             ? "Processing your voice…"
             : isListening
             ? "I’m listening…"
-            : "Talk normally with friends. Say “CallBuddy” when you want AI help."}
+            : "Use Friend Mic for people, AI Mic for CallBuddy, and choose Private or Shared AI speaker."}
         </div>
 
         {isInitializing ? null : !participant ? (
@@ -1150,11 +1437,26 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
         ) : (
           <div className="voice-room-controls">
             <button
+              className={`voice-control friend-mic-control ${
+                friendMicEnabled ? "active" : ""
+              }`}
+              type="button"
+              onClick={toggleFriendMic}
+              disabled={room?.status === "ended"}
+            >
+              {friendMicEnabled ? <Mic size={19} /> : <MicOff size={19} />}
+
+              <span>
+                {friendMicEnabled ? "FRIEND MIC ON" : "FRIEND MIC OFF"}
+              </span>
+            </button>
+
+            <button
               className={`voice-control mic-control ${
                 isListening ? "active" : ""
               }`}
               type="button"
-              onClick={toggleMicrophone}
+              onClick={toggleAiMic}
               disabled={
                 room?.status === "ended" ||
                 (isListening ? false : isSpeaking || isThinking)
@@ -1163,14 +1465,34 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
               {isListening ? <Mic size={19} /> : <MicOff size={19} />}
 
               <span>
-                {isSpeaking
-                  ? "CALLBUDDY SPEAKING"
-                  : isThinking
-                  ? "PROCESSING"
+                {isThinking
+                  ? "AI THINKING"
                   : isListening
-                  ? "LISTENING"
-                  : "MICROPHONE"}
+                  ? "AI MIC ON"
+                  : "AI MIC OFF"}
               </span>
+            </button>
+
+            <button
+              className={`voice-control speaker-control ${aiSpeakerMode}`}
+              type="button"
+              onClick={toggleAiSpeakerMode}
+              disabled={room?.status === "ended"}
+            >
+              <Volume2 size={19} />
+
+              <span>
+                AI SPEAKER {aiSpeakerMode === "shared" ? "SHARED" : "PRIVATE"}
+              </span>
+            </button>
+
+            <button
+              className="voice-control panel-control"
+              type="button"
+              onClick={() => setIsParticipantPanelOpen((current) => !current)}
+            >
+              <Users size={19} />
+              <span>{isParticipantPanelOpen ? "HIDE PANEL" : "ROOM PANEL"}</span>
             </button>
 
             <button
@@ -1207,6 +1529,108 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
         </div>
       </section>
 
+      {participant && (
+        <section className="voice-privacy-dashboard">
+          <div className="voice-privacy-heading">
+            <ShieldCheck size={16} />
+            <div>
+              <span>AI PRIVACY DASHBOARD</span>
+              <strong>Nothing is hidden</strong>
+            </div>
+          </div>
+
+          {[
+            ["Friend Mic", selfPrivacyState.friendMicEnabled ? "ON" : "OFF"],
+            ["AI Mic", selfPrivacyState.aiMicEnabled ? "ON" : "OFF"],
+            ["AI Speaker", selfPrivacyState.aiSpeakerMode.toUpperCase()],
+            ["AI Memory", selfPrivacyState.aiMemoryEnabled ? "SHARED" : "PRIVATE"],
+            ["AI Listening", selfPrivacyState.aiListening ? "ON" : "OFF"],
+            ["Status", selfPrivacyState.aiStatus],
+          ].map(([label, value]) => (
+            <div className="voice-privacy-item" key={label}>
+              <span>{label}</span>
+              <strong>{value}</strong>
+            </div>
+          ))}
+        </section>
+      )}
+
+      {participant && isParticipantPanelOpen && (
+        <section className="voice-room-side-panel">
+          <div className="voice-panel-column">
+            <div className="voice-panel-heading">
+              <span>PARTICIPANTS</span>
+              <strong>{participantRows.length} ONLINE</strong>
+            </div>
+
+            {participantRows.map((item) => {
+              const privacy = privacyStates[item.participantId]?.state;
+
+              return (
+                <article className="voice-participant-card" key={item.participantId}>
+                  <div className="voice-participant-avatar">
+                    {(item.name || "G").slice(0, 1).toUpperCase()}
+                  </div>
+
+                  <div>
+                    <strong>{item.name}</strong>
+                    <span>{item.isHost ? "HOST" : "GUEST"} · ONLINE</span>
+                  </div>
+
+                  <div className="voice-participant-state">
+                    <b>{privacy?.friendMicEnabled ? "FRIEND ON" : "FRIEND OFF"}</b>
+                    <b>{privacy?.aiMicEnabled ? "AI ON" : "AI OFF"}</b>
+                    <b>{privacy?.aiSpeakerMode?.toUpperCase() || "PRIVATE"}</b>
+                  </div>
+                </article>
+              );
+            })}
+
+            <div className="voice-panel-heading recently-left-heading">
+              <span>RECENTLY LEFT</span>
+              <strong>{recentlyLeftRows.length}</strong>
+            </div>
+
+            {recentlyLeftRows.length === 0 ? (
+              <p className="voice-panel-empty">No one has left yet.</p>
+            ) : (
+              recentlyLeftRows.map((item) => (
+                <article className="voice-participant-card is-left" key={item.participantId}>
+                  <div className="voice-participant-avatar">
+                    {(item.name || "G").slice(0, 1).toUpperCase()}
+                  </div>
+
+                  <div>
+                    <strong>{item.name}</strong>
+                    <span>LEFT · {formatTime(item.leftAt)}</span>
+                  </div>
+                </article>
+              ))
+            )}
+          </div>
+
+          <div className="voice-panel-column">
+            <div className="voice-panel-heading">
+              <span>ROOM TIMELINE</span>
+              <strong>{roomTimeline.length || 0} EVENTS</strong>
+            </div>
+
+            <div className="voice-room-timeline">
+              {roomTimeline.length === 0 ? (
+                <p>No privacy or room events yet.</p>
+              ) : (
+                roomTimeline.map((event) => (
+                  <article key={event.id}>
+                    <span>{formatTime(event.createdAt)}</span>
+                    <p>{event.content}</p>
+                  </article>
+                ))
+              )}
+            </div>
+          </div>
+        </section>
+      )}
+
       <section className="voice-transcript-panel">
         <div className="voice-transcript-heading">
           <div>
@@ -1217,27 +1641,33 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
           <Volume2 size={17} />
         </div>
 
-        <div className="voice-transcript-list">
-          {transcript.length === 0 && !liveSpeech ? (
+        <div
+          className="voice-transcript-list"
+          ref={transcriptListRef}
+          onScroll={handleTranscriptScroll}
+        >
+          {visibleTranscript.length === 0 && !liveSpeech ? (
             <div className="voice-transcript-empty">
               <Waves size={23} />
               <p>NO VOICE ACTIVITY YET</p>
               <span>
-                Join the room, then speak normally or call “CallBuddy” for AI
-                help.
+                Turn on AI Mic when you want CallBuddy to listen and respond.
               </span>
             </div>
           ) : (
             <>
-              {transcript.map((line, index) => (
+              {visibleTranscript.map((line, index) => (
                 <article
                   className={`voice-transcript-line ${
                     line.speakerType === "assistant" ? "assistant" : "user"
-                  }`}
+                  } ${line.isPrivate ? "is-private" : ""}`}
                   key={`${line.createdAt}_${index}`}
                 >
                   <div>
-                    <span>{line.speakerName}</span>
+                    <span>
+                      {line.speakerName}
+                      {line.isPrivate ? " / PRIVATE" : ""}
+                    </span>
                     <time>{formatTime(line.createdAt)}</time>
                   </div>
 
@@ -1260,6 +1690,16 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
 
           <div ref={transcriptEndRef} />
         </div>
+
+        {hasNewTranscript && (
+          <button
+            className="voice-new-messages-button"
+            type="button"
+            onClick={scrollTranscriptToBottom}
+          >
+            New Messages
+          </button>
+        )}
       </section>
     </main>
   );

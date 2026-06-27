@@ -36,6 +36,8 @@ class WhisperProvider {
       model: this.model,
       response_format: "json",
       temperature: 0,
+      prompt:
+        "Transcribe natural conversational speech. The speaker may use English, Hindi, or Hinglish. Prefer readable Latin-script Hinglish when mixed. Do not add filler phrases that were not spoken.",
     });
 
     return (transcription.text || "").trim();

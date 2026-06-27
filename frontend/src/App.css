@@ -1842,6 +1842,13 @@ textarea:focus-visible {
 }
 
 @media (max-width: 760px) {
+  .app-shell {
+    height: auto;
+    min-height: 100dvh;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
   .topbar {
     height: 52px;
     grid-template-columns: 1fr auto;

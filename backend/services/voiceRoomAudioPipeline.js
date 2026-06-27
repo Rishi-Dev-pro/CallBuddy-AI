@@ -1,4 +1,4 @@
-const { createVoiceRoomAiReply, shouldCallBuddyReply } = require("./voiceRoomAi");
+const { createVoiceRoomAiReply } = require("./voiceRoomAi");
 
 const MAX_CHUNK_BYTES = Number(process.env.VOICE_CHUNK_MAX_BYTES || 2_000_000);
 const MIN_CHUNK_INTERVAL_MS = Number(
@@ -9,6 +9,13 @@ const BUFFER_MAX_WINDOW_MS = Number(
   process.env.VOICE_BUFFER_MAX_WINDOW_MS || 15000
 );
 const BUFFER_MAX_BYTES = Number(process.env.VOICE_BUFFER_MAX_BYTES || 4_000_000);
+const STT_HALLUCINATION_PHRASES = new Set([
+  "thank you",
+  "thanks for watching",
+  "thank you for watching",
+  "bye",
+  "you",
+]);
 
 function toBuffer(chunk) {
   if (Buffer.isBuffer(chunk)) return chunk;
@@ -37,9 +44,21 @@ function createVoiceRoomAudioPipeline({
     socket.emit("voice-room:speech-error", { error: message });
   }
 
+  function normalizeTranscript(text = "") {
+    return text.replace(/\s+/g, " ").trim();
+  }
+
+  function isLikelyHallucinatedTranscript(text, audioBytes) {
+    const normalized = text.toLowerCase().replace(/[.!?,]/g, "").trim();
+
+    return audioBytes < 12_000 && STT_HALLUCINATION_PHRASES.has(normalized);
+  }
+
   async function handleAudioChunk(socket, payload = {}) {
     try {
       const { roomId, participantId, mimeType, isFinal } = payload;
+      const aiSpeakerMode =
+        payload.aiSpeakerMode === "shared" ? "shared" : "private";
       const audioBuffer = toBuffer(payload.chunk);
 
       if (!roomId || !participantId || !audioBuffer) {
@@ -116,11 +135,15 @@ function createVoiceRoomAudioPipeline({
         return;
       }
 
-      const transcriptText = (await speechProvider.transcribe(mergedAudioBuffer, mimeType))
-        .replace(/\s+/g, " ")
-        .trim();
+      const transcriptText = normalizeTranscript(
+        await speechProvider.transcribe(mergedAudioBuffer, mimeType)
+      );
 
       if (!transcriptText) return;
+
+      if (isLikelyHallucinatedTranscript(transcriptText, mergedAudioBuffer.length)) {
+        return;
+      }
 
       const duplicateKey = `${roomId}:${participantId}`;
       const previousTranscript = lastTranscriptByParticipant.get(duplicateKey);
@@ -146,6 +169,44 @@ function createVoiceRoomAudioPipeline({
         createdAt: new Date(),
       };
 
+      if (aiSpeakerMode === "private") {
+        socket.emit("voice-room:transcript", {
+          line: {
+            ...userLine,
+            isPrivate: true,
+          },
+          visibility: "private",
+        });
+
+        socket.emit("voice-room:ai-thinking", {
+          participantId: participant.participantId,
+          visibility: "private",
+        });
+
+        const reply = await createVoiceRoomAiReply({
+          client: llmClient,
+          room: {
+            ...room.toObject(),
+            transcript: [...room.transcript, userLine],
+          },
+          currentLine: userLine,
+        });
+
+        socket.emit("voice-room:ai-response", {
+          line: {
+            participantId: null,
+            speakerName: "CALLBUDDY AI",
+            speakerType: "assistant",
+            content: reply,
+            createdAt: new Date(),
+            isPrivate: true,
+          },
+          visibility: "private",
+        });
+
+        return;
+      }
+
       room.transcript.push(userLine);
       await room.save();
 
@@ -161,8 +222,6 @@ function createVoiceRoomAudioPipeline({
         event: "message-sent",
       });
 
-      if (!shouldCallBuddyReply(transcriptText)) return;
-
       io.to(`voice-room:${room._id}`).emit("voice-room:ai-thinking", {
         participantId: participant.participantId,
       });
@@ -171,6 +230,7 @@ function createVoiceRoomAudioPipeline({
       const reply = await createVoiceRoomAiReply({
         client: llmClient,
         room: freshRoom || room,
+        currentLine: userLine,
       });
 
       const assistantLine = {
