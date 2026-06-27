@@ -1,0 +1,9 @@
+html {
+  background: #111210;
+  scroll-behavior: smooth;
+}
+
+body {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
