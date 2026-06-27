@@ -1,3 +1,15 @@
+// Workaround for Node.js 24 SRV DNS resolution issue on Windows.
+// Remove after migrating to Node 22 LTS if no longer needed.
+const dns = require("node:dns");
+
+dns.setServers([
+  "1.1.1.1",
+  "8.8.8.8",
+]);
+
+console.log("Node DNS:", dns.getServers());
+
+
 const express = require("express");
 const cors = require("cors");
 const http = require("http");
@@ -1494,10 +1506,7 @@ Opening script: ${script || "No custom opening script provided."}
   }
 });
 
-mongoose
-  .connect(process.env.MONGODB_URI)
-  .then(() => {
-    console.log("MongoDB connected: callbuddy_ai database");
+
 
 
     /* =========================
@@ -1561,11 +1570,17 @@ app.get("/api/voice-archive/:roomId", authRequired, async (req, res) => {
     });
   }
 });
+    
+  
+  mongoose
+  .connect(process.env.MONGODB_URI)
+  .then(() => {
+    console.log("✅ MongoDB Connected!");
     server.listen(PORT, () => {
-  console.log(`CallBuddy AI server running at http://localhost:${PORT}`);
-});
+      console.log(`CallBuddy AI server running at http://localhost:${PORT}`);
+    });
   })
-  .catch((error) => {
-    console.error("MongoDB connection error:", error.message);
+  .catch((err) => {
+    console.dir(err, { depth: null });
     process.exit(1);
   });
