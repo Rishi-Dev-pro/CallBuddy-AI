@@ -583,14 +583,14 @@ const openVoiceArchiveRoom = async (roomId) => {
       const room = response.data.room;
 
       const publicAppUrl =
-  import.meta.env.VITE_PUBLIC_APP_URL || window.location.origin;
+        import.meta.env.VITE_PUBLIC_APP_URL || window.location.origin;
 
-const roomLink = `${publicAppUrl}/voice-room/${room.id}`;
+      const roomLink = `${publicAppUrl}/voice-room/${room.inviteCode || room.id}`;
 
-setCreatedVoiceRoom({
-  ...room,
-  link: roomLink,
-});
+      setCreatedVoiceRoom({
+        ...room,
+        link: roomLink,
+      });
 
 setVoiceRoomName("");
 

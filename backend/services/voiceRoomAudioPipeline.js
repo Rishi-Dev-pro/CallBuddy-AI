@@ -9,6 +9,9 @@ const BUFFER_MAX_WINDOW_MS = Number(
   process.env.VOICE_BUFFER_MAX_WINDOW_MS || 15000
 );
 const BUFFER_MAX_BYTES = Number(process.env.VOICE_BUFFER_MAX_BYTES || 4_000_000);
+const MAX_STT_PER_PARTICIPANT_PER_MIN = 16;
+const MAX_STT_PER_ROOM_PER_MIN = 36;
+
 const STT_HALLUCINATION_PHRASES = new Set([
   "thank you",
   "thanks for watching",
@@ -39,6 +42,53 @@ function createVoiceRoomAudioPipeline({
   const lastTranscriptByParticipant = new Map();
   const audioBuffers = new Map();
   const socketBufferKeys = new Map();
+  const sttTimestampsByParticipant = new Map();
+  const sttTimestampsByRoom = new Map();
+
+  // Periodically purge expired rate-limit timestamps every 5 minutes
+  const cleanupTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [key, timestamps] of sttTimestampsByParticipant.entries()) {
+      const active = timestamps.filter((t) => now - t < 60000);
+      if (active.length === 0) {
+        sttTimestampsByParticipant.delete(key);
+      } else {
+        sttTimestampsByParticipant.set(key, active);
+      }
+    }
+    for (const [key, timestamps] of sttTimestampsByRoom.entries()) {
+      const active = timestamps.filter((t) => now - t < 60000);
+      if (active.length === 0) {
+        sttTimestampsByRoom.delete(key);
+      } else {
+        sttTimestampsByRoom.set(key, active);
+      }
+    }
+  }, 300000);
+
+  if (cleanupTimer.unref) {
+    cleanupTimer.unref();
+  }
+
+  function checkSttRateLimit(roomId, participantId, now = Date.now()) {
+    const pHistory = (sttTimestampsByParticipant.get(participantId) || []).filter(
+      (ts) => now - ts < 60000
+    );
+    if (pHistory.length >= MAX_STT_PER_PARTICIPANT_PER_MIN) {
+      return false;
+    }
+    const rHistory = (sttTimestampsByRoom.get(roomId) || []).filter(
+      (ts) => now - ts < 60000
+    );
+    if (rHistory.length >= MAX_STT_PER_ROOM_PER_MIN) {
+      return false;
+    }
+    pHistory.push(now);
+    rHistory.push(now);
+    sttTimestampsByParticipant.set(participantId, pHistory);
+    sttTimestampsByRoom.set(roomId, rHistory);
+    return true;
+  }
 
   function emitSpeechError(socket, message) {
     socket.emit("voice-room:speech-error", { error: message });
@@ -66,8 +116,23 @@ function createVoiceRoomAudioPipeline({
         return;
       }
 
+      // Security check: socket must belong to room
       if (!socket.rooms.has(`voice-room:${roomId}`)) {
         emitSpeechError(socket, "Socket is not joined to this Voice Room.");
+        return;
+      }
+
+      // Security check: verified identity on socket must match payload
+      const verifiedParticipantId = socket.data?.verifiedParticipantId;
+      const verifiedRoomId = socket.data?.verifiedRoomId;
+
+      if (verifiedRoomId && String(verifiedRoomId) !== String(roomId)) {
+        emitSpeechError(socket, "Unauthorized room target.");
+        return;
+      }
+
+      if (verifiedParticipantId && verifiedParticipantId !== participantId) {
+        emitSpeechError(socket, "Participant identity mismatch.");
         return;
       }
 
@@ -132,6 +197,15 @@ function createVoiceRoomAudioPipeline({
 
       if (!participant) {
         emitSpeechError(socket, "Participant is not active in this room.");
+        return;
+      }
+
+      // Resource abuse check: limit STT API calls per participant and room
+      if (!checkSttRateLimit(String(roomId), participant.participantId, now)) {
+        emitSpeechError(
+          socket,
+          "Speech processing rate limit reached. Please pause a moment."
+        );
         return;
       }
 
@@ -279,6 +353,7 @@ function createVoiceRoomAudioPipeline({
   return {
     handleAudioChunk,
     cleanupSocket,
+    checkSttRateLimit,
   };
 }
 

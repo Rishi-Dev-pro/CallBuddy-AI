@@ -45,9 +45,10 @@ function getStoredParticipant(roomId) {
 function saveParticipant(roomId, participant) {
   const minimalData = {
     participantId: participant.participantId,
-    participantName: participant.participantName,
+    participantName: participant.participantName || participant.name,
     isHost: participant.isHost,
     isLoggedIn: participant.isLoggedIn || Boolean(participant.userId),
+    roomToken: participant.roomToken,
   };
 
   sessionStorage.setItem(
@@ -128,15 +129,17 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
   const [isTranscriptAtBottom, setIsTranscriptAtBottom] = useState(true);
   const [hasNewTranscript, setHasNewTranscript] = useState(false);
 
+  const effectiveToken = token || participant?.roomToken;
+
   const authHeaders = useMemo(() => {
-    return token
+    return effectiveToken
       ? {
           headers: {
-            Authorization: `Bearer ${token}`,
+            Authorization: `Bearer ${effectiveToken}`,
           },
         }
       : {};
-  }, [token]);
+  }, [effectiveToken]);
 
   useEffect(() => {
     participantRef.current = participant;
@@ -354,6 +357,12 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
 
     const socket = io(API_URL, {
       transports: ["websocket", "polling"],
+      auth: {
+        token: effectiveToken,
+        roomToken: participant?.roomToken,
+        roomId: room?.id || roomId,
+        participantId: participant.participantId,
+      },
     });
 
     socketRef.current = socket;
@@ -638,7 +647,7 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
     }
 
     try {
-      const response = await axios.get(`${API_URL}/api/voice-rooms/${roomId}`);
+      const response = await axios.get(`${API_URL}/api/voice-rooms/${roomId}`, authHeaders);
       const loadedRoom = response.data.room;
 
       setRoom(loadedRoom);
@@ -656,7 +665,7 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
       );
       setStatus("OFFLINE");
     }
-  }, [roomId]);
+  }, [roomId, authHeaders]);
 
   /* UNIVERSAL INITIALIZATION ENGINE */
   useEffect(() => {
@@ -1207,9 +1216,14 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
         return;
       }
 
-      await axios.post(`${API_URL}/api/voice-rooms/${roomId}/leave`, {
-        participantId: participant.participantId,
-      });
+      await axios.post(
+        `${API_URL}/api/voice-rooms/${roomId}/leave`,
+        {
+          participantId: participant.participantId,
+          roomToken: participant.roomToken,
+        },
+        authHeaders
+      );
 
       sessionStorage.removeItem(`callbuddy_voice_${roomId}`);
       setParticipant(null);
@@ -1225,7 +1239,7 @@ function VoiceRoom({ token, currentUser, isAuthLoading = false, onLogout }) {
   };
 
   const copyRoomLink = async () => {
-    const link = `${window.location.origin}/voice-room/${roomId}`;
+    const link = `${window.location.origin}/voice-room/${room?.inviteCode || roomId}`;
 
     try {
       await navigator.clipboard.writeText(link);

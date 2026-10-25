@@ -13,6 +13,7 @@ console.log("Node DNS:", dns.getServers());
 const express = require("express");
 const cors = require("cors");
 const http = require("http");
+const crypto = require("crypto");
 const { Server } = require("socket.io");
 const OpenAI = require("openai");
 const mongoose = require("mongoose");
@@ -29,6 +30,40 @@ const {
 } = require("./services/voiceRoomAi");
 
 require("dotenv").config();
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error("FATAL: JWT_SECRET environment variable is missing.");
+  process.exit(1);
+}
+if (
+  process.env.NODE_ENV === "production" &&
+  (JWT_SECRET === "callbuddy_dev_secret_change_this" || JWT_SECRET.length < 32)
+) {
+  console.error("FATAL: Insecure JWT_SECRET configured in production.");
+  process.exit(1);
+}
+
+function createRoomToken({
+  participantId,
+  roomId,
+  userId = null,
+  isHost = false,
+  name = "",
+}) {
+  return jwt.sign(
+    {
+      participantId,
+      roomId: String(roomId),
+      userId: userId ? String(userId) : null,
+      isHost: Boolean(isHost),
+      name,
+      isGuest: !userId,
+    },
+    JWT_SECRET,
+    { expiresIn: "24h" }
+  );
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -47,6 +82,7 @@ function isOriginAllowed(origin) {
     const { hostname, protocol } = new URL(origin);
     const isLocalhost = hostname === "localhost" || hostname === "127.0.0.1";
     const isCloudflareTunnel =
+      process.env.NODE_ENV !== "production" &&
       protocol === "https:" &&
       (hostname === "trycloudflare.com" ||
         hostname.endsWith(".trycloudflare.com"));
@@ -66,6 +102,32 @@ const io = new Server(server, {
   },
 });
 
+io.use((socket, next) => {
+  try {
+    const token =
+      socket.handshake.auth?.token ||
+      socket.handshake.auth?.roomToken ||
+      (socket.handshake.headers?.authorization?.startsWith("Bearer ")
+        ? socket.handshake.headers.authorization.slice(7)
+        : null);
+
+    if (!token) {
+      return next(new Error("Authentication required for realtime connection"));
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    socket.data.userId = decoded.userId || null;
+    socket.data.participantId = decoded.participantId || null;
+    socket.data.roomId = decoded.roomId || null;
+    socket.data.isGuest = Boolean(decoded.isGuest);
+    socket.data.auth = decoded;
+
+    next();
+  } catch {
+    return next(new Error("Invalid or expired session token"));
+  }
+});
+
 
 const groq = new OpenAI({
   apiKey: process.env.GROQ_API_KEY,
@@ -75,6 +137,58 @@ const groq = new OpenAI({
 const speechProvider = createSpeechProvider({ client: groq });
 let voiceRoomAudioPipeline = null;
 const apiRateLimits = new Map();
+
+// Periodic cleanup of expired rate limit entries to prevent memory leaks
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of apiRateLimits.entries()) {
+    if (now > entry.resetAt) {
+      apiRateLimits.delete(key);
+    }
+  }
+}, 300000).unref();
+
+function createOperationRateLimit({ windowMs = 60000, max = 20, message = "Rate limit exceeded. Please slow down." }) {
+  const store = new Map();
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of store.entries()) {
+      if (now > entry.resetAt) {
+        store.delete(key);
+      }
+    }
+  }, 300000).unref();
+
+  return (req, res, next) => {
+    const key = req.userId ? `user:${req.userId}` : req.ip || req.socket.remoteAddress || "unknown";
+    const now = Date.now();
+    const entry = store.get(key) || { count: 0, resetAt: now + windowMs };
+
+    if (now > entry.resetAt) {
+      entry.count = 0;
+      entry.resetAt = now + windowMs;
+    }
+
+    entry.count += 1;
+    store.set(key, entry);
+
+    if (entry.count > max) {
+      return res.status(429).json({ error: message });
+    }
+
+    next();
+  };
+}
+
+async function findVoiceRoomByIdOrInvite(identifier) {
+  if (!identifier) return null;
+  const isObjectId = mongoose.Types.ObjectId.isValid(identifier);
+  const query = isObjectId
+    ? { $or: [{ _id: identifier }, { inviteCode: identifier }] }
+    : { inviteCode: identifier };
+  return VoiceRoom.findOne(query);
+}
 
 function securityHeaders(req, res, next) {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -134,38 +248,106 @@ app.use(apiRateLimit);
 
 io.on("connection", (socket) => {
   console.log(`Socket connected: ${socket.id}`);
+  const signalingRateLimits = [];
 
-  socket.on("voice-room:join", ({ roomId, participant }) => {
-    if (!roomId || !participant?.participantId) return;
-
-    const socketRoom = `voice-room:${roomId}`;
-
-    socket.join(socketRoom);
-
-    /*
-      Tell the new participant which already-connected browsers
-      they need to make WebRTC connections to.
-    */
-    const existingSocketIds = [];
-
-    for (const socketId of io.sockets.adapter.rooms.get(socketRoom) || []) {
-      if (socketId !== socket.id) {
-        existingSocketIds.push(socketId);
-      }
+  function checkSignalingRate() {
+    const now = Date.now();
+    while (signalingRateLimits.length > 0 && now - signalingRateLimits[0] > 10000) {
+      signalingRateLimits.shift();
     }
+    if (signalingRateLimits.length > 120) {
+      return false;
+    }
+    signalingRateLimits.push(now);
+    return true;
+  }
 
-    socket.emit("webrtc:existing-peers", {
-      peerIds: existingSocketIds,
-    });
+  function isValidSignalingTarget(targetPeerId) {
+    if (!targetPeerId || typeof targetPeerId !== "string") return false;
+    const verifiedRoomId = socket.data?.verifiedRoomId;
+    if (!verifiedRoomId) return false;
+    const roomSockets = io.sockets.adapter.rooms.get(`voice-room:${verifiedRoomId}`);
+    return Boolean(roomSockets && roomSockets.has(targetPeerId));
+  }
 
-    socket.to(socketRoom).emit("webrtc:peer-joined", {
-      peerId: socket.id,
-      participant,
-    });
+  socket.on("voice-room:join", async ({ roomId, participant }) => {
+    if (!roomId) return;
 
-    socket.to(socketRoom).emit("voice-room:participant-joined", {
-      participant,
-    });
+    try {
+      const room = await findVoiceRoomByIdOrInvite(roomId);
+      if (!room || room.status === "ended") {
+        socket.emit("voice-room:speech-error", { error: "Voice Room not active." });
+        return;
+      }
+
+      // Determine verified participant identity
+      let verifiedParticipant = null;
+
+      if (socket.data.userId) {
+        verifiedParticipant = room.participants.find(
+          (p) => String(p.userId || "") === String(socket.data.userId) && !p.leftAt
+        );
+      }
+
+      if (!verifiedParticipant && socket.data.participantId) {
+        verifiedParticipant = room.participants.find(
+          (p) => p.participantId === socket.data.participantId && !p.leftAt
+        );
+      }
+
+      // Fallback: match candidate if token roomId matches room
+      if (!verifiedParticipant && participant?.participantId) {
+        const candidate = room.participants.find(
+          (p) => p.participantId === participant.participantId && !p.leftAt
+        );
+        if (candidate) {
+          if (socket.data.userId && String(candidate.userId || "") === String(socket.data.userId)) {
+            verifiedParticipant = candidate;
+          } else if (socket.data.participantId === candidate.participantId) {
+            verifiedParticipant = candidate;
+          }
+        }
+      }
+
+      if (!verifiedParticipant) {
+        socket.emit("voice-room:speech-error", { error: "Participant not recognized in this room." });
+        return;
+      }
+
+      socket.data.verifiedParticipantId = verifiedParticipant.participantId;
+      socket.data.verifiedRoomId = room._id.toString();
+
+      const socketRoom = `voice-room:${room._id}`;
+      socket.join(socketRoom);
+
+      const existingSocketIds = [];
+      for (const socketId of io.sockets.adapter.rooms.get(socketRoom) || []) {
+        if (socketId !== socket.id) {
+          existingSocketIds.push(socketId);
+        }
+      }
+
+      socket.emit("webrtc:existing-peers", {
+        peerIds: existingSocketIds,
+      });
+
+      const participantPayload = {
+        participantId: verifiedParticipant.participantId,
+        name: verifiedParticipant.name,
+        isHost: verifiedParticipant.isHost,
+      };
+
+      socket.to(socketRoom).emit("webrtc:peer-joined", {
+        peerId: socket.id,
+        participant: participantPayload,
+      });
+
+      socket.to(socketRoom).emit("voice-room:participant-joined", {
+        participant: participantPayload,
+      });
+    } catch (joinError) {
+      console.error("Socket room join error:", joinError);
+    }
   });
 
   socket.on("voice-room:audio-chunk", (payload) => {
@@ -180,22 +362,26 @@ io.on("connection", (socket) => {
   });
 
   socket.on("voice-room:privacy-state", ({ roomId, participant, state }) => {
-    if (!roomId || !participant?.participantId || !state) return;
+    if (!roomId || !state) return;
+    const verifiedParticipantId = socket.data?.verifiedParticipantId;
+    const verifiedRoomId = socket.data?.verifiedRoomId;
 
-    socket.to(`voice-room:${roomId}`).emit("voice-room:privacy-state", {
-      participant,
+    if (!verifiedParticipantId || !verifiedRoomId) return;
+
+    socket.to(`voice-room:${verifiedRoomId}`).emit("voice-room:privacy-state", {
+      participant: {
+        participantId: verifiedParticipantId,
+        name: participant?.name || participant?.participantName || "Participant",
+      },
       state,
       updatedAt: new Date().toISOString(),
     });
   });
 
-  /*
-    WebRTC signaling:
-    These events only pass connection setup data.
-    Actual microphone audio travels browser-to-browser through WebRTC.
-  */
   socket.on("webrtc:offer", ({ targetPeerId, offer }) => {
-    if (!targetPeerId || !offer) return;
+    if (!checkSignalingRate()) return;
+    if (!isValidSignalingTarget(targetPeerId) || !offer || offer.type !== "offer" || typeof offer.sdp !== "string") return;
+    if (offer.sdp.length > 65536) return;
 
     io.to(targetPeerId).emit("webrtc:offer", {
       fromPeerId: socket.id,
@@ -204,7 +390,9 @@ io.on("connection", (socket) => {
   });
 
   socket.on("webrtc:answer", ({ targetPeerId, answer }) => {
-    if (!targetPeerId || !answer) return;
+    if (!checkSignalingRate()) return;
+    if (!isValidSignalingTarget(targetPeerId) || !answer || answer.type !== "answer" || typeof answer.sdp !== "string") return;
+    if (answer.sdp.length > 65536) return;
 
     io.to(targetPeerId).emit("webrtc:answer", {
       fromPeerId: socket.id,
@@ -213,7 +401,9 @@ io.on("connection", (socket) => {
   });
 
   socket.on("webrtc:ice-candidate", ({ targetPeerId, candidate }) => {
-    if (!targetPeerId || !candidate) return;
+    if (!checkSignalingRate()) return;
+    if (!isValidSignalingTarget(targetPeerId) || !candidate) return;
+    if (candidate.candidate && typeof candidate.candidate === "string" && candidate.candidate.length > 4096) return;
 
     io.to(targetPeerId).emit("webrtc:ice-candidate", {
       fromPeerId: socket.id,
@@ -222,17 +412,19 @@ io.on("connection", (socket) => {
   });
 
   socket.on("voice-room:leave", ({ roomId, participant }) => {
-    if (!roomId || !participant?.participantId) return;
+    const verifiedRoomId = socket.data?.verifiedRoomId;
+    const verifiedParticipantId = socket.data?.verifiedParticipantId;
+    if (!verifiedRoomId) return;
 
-    const socketRoom = `voice-room:${roomId}`;
+    const socketRoom = `voice-room:${verifiedRoomId}`;
 
     socket.to(socketRoom).emit("webrtc:peer-left", {
       peerId: socket.id,
-      participant,
+      participant: { participantId: verifiedParticipantId },
     });
 
     socket.to(socketRoom).emit("voice-room:participant-left", {
-      participant,
+      participant: { participantId: verifiedParticipantId },
     });
 
     socket.leave(socketRoom);
@@ -313,11 +505,7 @@ function getSafeUser(user) {
 }
 
 function createToken(userId) {
-  return jwt.sign(
-    { userId },
-    process.env.JWT_SECRET || "callbuddy_dev_secret_change_this",
-    { expiresIn: "30d" }
-  );
+  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "30d" });
 }
 
 function authRequired(req, res, next) {
@@ -331,10 +519,11 @@ function authRequired(req, res, next) {
       return res.status(401).json({ error: "Login required." });
     }
 
-    const decoded = jwt.verify(
-      token,
-      process.env.JWT_SECRET || "callbuddy_dev_secret_change_this"
-    );
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    if (!decoded.userId) {
+      return res.status(401).json({ error: "Invalid user token." });
+    }
 
     req.userId = decoded.userId;
     next();
@@ -343,7 +532,13 @@ function authRequired(req, res, next) {
   }
 }
 
-app.post("/api/speech/transcribe", authRequired, async (req, res) => {
+const transcribeRateLimit = createOperationRateLimit({
+  windowMs: 60000,
+  max: 20,
+  message: "Too many voice notes transcribed. Please slow down.",
+});
+
+app.post("/api/speech/transcribe", authRequired, transcribeRateLimit, async (req, res) => {
   try {
     const { audioBase64, mimeType } = req.body || {};
 
@@ -734,7 +929,13 @@ app.delete("/api/sessions/:sessionId", authRequired, async (req, res) => {
   }
 });
 
-app.post("/api/sessions/:sessionId/memory", authRequired, async (req, res) => {
+const memoryRateLimit = createOperationRateLimit({
+  windowMs: 60000,
+  max: 6,
+  message: "Memory snapshot limit reached. Please wait a minute.",
+});
+
+app.post("/api/sessions/:sessionId/memory", authRequired, memoryRateLimit, async (req, res) => {
   try {
     const session = await getOwnedSession(
       req.params.sessionId,
@@ -858,27 +1059,28 @@ function getVoiceRoomSummary(room) {
 function getPublicVoiceRoom(room) {
   return {
     ...getVoiceRoomSummary(room),
+    inviteCode: room.inviteCode || room._id.toString(),
     hostUserId: room.hostUserId.toString(),
     participants: room.participants
-  .filter((participant) => !participant.leftAt)
-  .map((participant) => ({
-    participantId: participant.participantId,
-    userId: participant.userId?.toString() || null,
-    name: participant.name,
-    isHost: participant.isHost,
-    joinedAt: participant.joinedAt,
-  })),
+      .filter((participant) => !participant.leftAt)
+      .map((participant) => ({
+        participantId: participant.participantId,
+        userId: participant.userId?.toString() || null,
+        name: participant.name,
+        isHost: participant.isHost,
+        joinedAt: participant.joinedAt,
+      })),
     recentlyLeft: room.participants
-  .filter((participant) => participant.leftAt)
-  .slice(-8)
-  .map((participant) => ({
-    participantId: participant.participantId,
-    userId: participant.userId?.toString() || null,
-    name: participant.name,
-    isHost: participant.isHost,
-    joinedAt: participant.joinedAt,
-    leftAt: participant.leftAt,
-  })),
+      .filter((participant) => participant.leftAt)
+      .slice(-8)
+      .map((participant) => ({
+        participantId: participant.participantId,
+        userId: participant.userId?.toString() || null,
+        name: participant.name,
+        isHost: participant.isHost,
+        joinedAt: participant.joinedAt,
+        leftAt: participant.leftAt,
+      })),
     transcript: room.transcript.map((line) => ({
       id: line._id?.toString() || `${line.createdAt}_${line.participantId}`,
       participantId: line.participantId,
@@ -890,8 +1092,14 @@ function getPublicVoiceRoom(room) {
   };
 }
 
+const voiceRoomCreationRateLimit = createOperationRateLimit({
+  windowMs: 60000,
+  max: 10,
+  message: "Too many Voice Rooms created. Please wait a moment.",
+});
+
 /* Host creates a shareable Voice Room */
-app.post("/api/voice-rooms", authRequired, async (req, res) => {
+app.post("/api/voice-rooms", authRequired, voiceRoomCreationRateLimit, async (req, res) => {
   try {
     const { roomName } = req.body;
     const cleanRoomName = roomName?.trim() || "Voice Room";
@@ -903,12 +1111,14 @@ app.post("/api/voice-rooms", authRequired, async (req, res) => {
     }
 
     const hostParticipantId = `host_${host._id}_${Date.now()}`;
+    const inviteCode = crypto.randomBytes(9).toString("base64url");
 
     const room = await VoiceRoom.create({
       title: cleanRoomName.slice(0, 60),
       hostUserId: host._id,
       hostName: host.name,
       status: "active",
+      inviteCode,
       participants: [
         {
           participantId: hostParticipantId,
@@ -929,10 +1139,20 @@ app.post("/api/voice-rooms", authRequired, async (req, res) => {
       ],
     });
 
+    const roomToken = createRoomToken({
+      participantId: hostParticipantId,
+      roomId: room._id.toString(),
+      userId: host._id.toString(),
+      isHost: true,
+      name: host.name,
+    });
+
     res.status(201).json({
       room: {
         ...getVoiceRoomSummary(room),
+        inviteCode,
         hostParticipantId,
+        roomToken,
       },
     });
   } catch (error) {
@@ -941,29 +1161,90 @@ app.post("/api/voice-rooms", authRequired, async (req, res) => {
   }
 });
 
-/* Anyone with the link can view the room.
-   Login is optional here. */
+/* 
+  Anyone with the valid link/invite can view room metadata.
+  Private room data (transcripts and participant list) requires active membership!
+*/
 app.get("/api/voice-rooms/:roomId", async (req, res) => {
   try {
-    const room = await VoiceRoom.findById(req.params.roomId);
+    const room = await findVoiceRoomByIdOrInvite(req.params.roomId);
 
     if (!room) {
       return res.status(404).json({ error: "Voice Room not found." });
     }
 
+    // Check if caller is authenticated and an active member or host
+    let isMember = false;
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+
+        if (decoded.userId) {
+          const isHost = String(room.hostUserId) === String(decoded.userId);
+          const isParticipant = room.participants.some(
+            (p) => String(p.userId || "") === String(decoded.userId) && !p.leftAt
+          );
+
+          if (isHost || isParticipant) {
+            isMember = true;
+          }
+        } else if (decoded.participantId) {
+          // Check if guest token matches an active participant in this room
+          if (
+            String(decoded.roomId || "") === String(room._id) &&
+            room.participants.some(
+              (p) => p.participantId === decoded.participantId && !p.leftAt
+            )
+          ) {
+            isMember = true;
+          }
+        }
+      } catch {
+        isMember = false;
+      }
+    }
+
+    if (isMember) {
+      return res.json({
+        room: {
+          ...getPublicVoiceRoom(room),
+          isMember: true,
+        },
+      });
+    }
+
+    // Non-members: return only metadata needed to render the Join Screen.
+    // Transcripts and full participant lists are strictly protected from non-members!
     res.json({
-      room: getPublicVoiceRoom(room),
+      room: {
+        id: room._id.toString(),
+        inviteCode: room.inviteCode || room._id.toString(),
+        title: room.title,
+        hostName: room.hostName,
+        status: room.status,
+        endedAt: room.endedAt,
+        createdAt: room.createdAt,
+        participantCount: room.participants.filter((p) => !p.leftAt).length,
+        isMember: false,
+      },
     });
-  } catch {
+  } catch (error) {
+    console.error("Get voice room error:", error);
     res.status(400).json({ error: "Invalid Voice Room link." });
   }
 });
 
-/* Guest joins by name.
-   If they send a valid token, their account name is used automatically. */
+/* 
+  Join Voice Room:
+  Anyone with the valid link can join.
+  Returns verified participant identity and roomToken for Socket/API access.
+*/
 app.post("/api/voice-rooms/:roomId/join", async (req, res) => {
   try {
-    const room = await VoiceRoom.findById(req.params.roomId);
+    const room = await findVoiceRoomByIdOrInvite(req.params.roomId);
 
     if (!room) {
       return res.status(404).json({ error: "Voice Room not found." });
@@ -981,12 +1262,10 @@ app.post("/api/voice-rooms/:roomId/join", async (req, res) => {
 
     if (token) {
       try {
-        const decoded = jwt.verify(
-          token,
-          process.env.JWT_SECRET || "callbuddy_dev_secret_change_this"
-        );
-
-        loggedInUser = await User.findById(decoded.userId);
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded.userId) {
+          loggedInUser = await User.findById(decoded.userId);
+        }
       } catch {
         loggedInUser = null;
       }
@@ -1000,32 +1279,40 @@ app.post("/api/voice-rooms/:roomId/join", async (req, res) => {
         error: "Please enter a name with at least 2 characters.",
       });
     }
-    /*
--------------------------------------------------------
-Already joined?
-Return existing participant instead of creating another.
--------------------------------------------------------
-*/
-if (loggedInUser) {
-  const existingParticipant = room.participants.find(
-    (participant) =>
-      String(participant.userId || "") ===
-        String(loggedInUser._id) &&
-      !participant.leftAt
-  );
 
-  if (existingParticipant) {
-    return res.json({
-      participant: {
-        participantId: existingParticipant.participantId,
-        name: existingParticipant.name,
-        isHost: existingParticipant.isHost,
-        isLoggedIn: true,
-      },
-      room: getPublicVoiceRoom(room),
-    });
-  }
-}
+    // If already joined as registered user, reuse participant identity
+    if (loggedInUser) {
+      const existingParticipant = room.participants.find(
+        (participant) =>
+          String(participant.userId || "") === String(loggedInUser._id) &&
+          !participant.leftAt
+      );
+
+      if (existingParticipant) {
+        const roomToken = createRoomToken({
+          participantId: existingParticipant.participantId,
+          roomId: room._id.toString(),
+          userId: loggedInUser._id.toString(),
+          isHost: existingParticipant.isHost,
+          name: existingParticipant.name,
+        });
+
+        return res.json({
+          participant: {
+            participantId: existingParticipant.participantId,
+            name: existingParticipant.name,
+            isHost: existingParticipant.isHost,
+            isLoggedIn: true,
+            roomToken,
+          },
+          room: {
+            ...getPublicVoiceRoom(room),
+            isMember: true,
+          },
+        });
+      }
+    }
+
     const participantId = `guest_${Date.now()}_${Math.random()
       .toString(36)
       .slice(2, 8)}`;
@@ -1048,19 +1335,31 @@ if (loggedInUser) {
 
     await room.save();
 
-io.to(`voice-room:${room._id}`).emit("voice-room:updated", {
-  room: getPublicVoiceRoom(room),
-  event: "participant-joined",
-});
+    const roomToken = createRoomToken({
+      participantId,
+      roomId: room._id.toString(),
+      userId: loggedInUser?._id?.toString() || null,
+      isHost: false,
+      name: participantName,
+    });
 
-res.status(201).json({
+    io.to(`voice-room:${room._id}`).emit("voice-room:updated", {
+      room: getPublicVoiceRoom(room),
+      event: "participant-joined",
+    });
+
+    res.status(201).json({
       participant: {
         participantId,
         name: participantName,
         isHost: false,
         isLoggedIn: Boolean(loggedInUser),
+        roomToken,
       },
-      room: getPublicVoiceRoom(room),
+      room: {
+        ...getPublicVoiceRoom(room),
+        isMember: true,
+      },
     });
   } catch (error) {
     console.error("Join voice room error:", error);
@@ -1068,16 +1367,19 @@ res.status(201).json({
   }
 });
 
-/* Guest leaves: only that guest disconnects */
+/* 
+  Guest leaves: only that guest disconnects.
+  Caller must prove ownership of participant identity via token to prevent unauthorized kicks.
+*/
 app.post("/api/voice-rooms/:roomId/leave", async (req, res) => {
   try {
-    const { participantId } = req.body;
+    const { participantId, roomToken: bodyRoomToken } = req.body || {};
 
     if (!participantId) {
       return res.status(400).json({ error: "participantId is required." });
     }
 
-    const room = await VoiceRoom.findById(req.params.roomId);
+    const room = await findVoiceRoomByIdOrInvite(req.params.roomId);
 
     if (!room) {
       return res.status(404).json({ error: "Voice Room not found." });
@@ -1089,6 +1391,36 @@ app.post("/api/voice-rooms/:roomId/leave", async (req, res) => {
 
     if (!participant) {
       return res.status(404).json({ error: "Participant not found." });
+    }
+
+    // Authorization check: Verify caller owns this participant identity
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : bodyRoomToken || null;
+
+    if (!token) {
+      return res.status(401).json({ error: "Authentication required to leave room." });
+    }
+
+    let isAuthorized = false;
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      if (decoded.participantId === participantId) {
+        isAuthorized = true;
+      } else if (
+        decoded.userId &&
+        participant.userId &&
+        String(decoded.userId) === String(participant.userId)
+      ) {
+        isAuthorized = true;
+      }
+    } catch {
+      return res.status(401).json({ error: "Invalid leave authorization." });
+    }
+
+    if (!isAuthorized) {
+      return res.status(403).json({ error: "You cannot leave on behalf of another participant." });
     }
 
     if (participant.isHost) {
@@ -1111,9 +1443,9 @@ app.post("/api/voice-rooms/:roomId/leave", async (req, res) => {
       await room.save();
 
       io.to(`voice-room:${room._id}`).emit("voice-room:updated", {
-  room: getPublicVoiceRoom(room),
-  event: "participant-left",
-});
+        room: getPublicVoiceRoom(room),
+        event: "participant-left",
+      });
     }
 
     res.json({
@@ -1129,12 +1461,9 @@ app.post("/api/voice-rooms/:roomId/leave", async (req, res) => {
 /* Only the creator can end the room for everyone */
 app.post("/api/voice-rooms/:roomId/end", authRequired, async (req, res) => {
   try {
-    const room = await VoiceRoom.findOne({
-      _id: req.params.roomId,
-      hostUserId: req.userId,
-    });
+    const room = await findVoiceRoomByIdOrInvite(req.params.roomId);
 
-    if (!room) {
+    if (!room || String(room.hostUserId) !== String(req.userId)) {
       return res.status(404).json({
         error: "Voice Room not found or you are not the host.",
       });
@@ -1161,8 +1490,8 @@ app.post("/api/voice-rooms/:roomId/end", authRequired, async (req, res) => {
       await room.save();
 
       io.to(`voice-room:${room._id}`).emit("voice-room:ended", {
-  room: getPublicVoiceRoom(room),
-});
+        room: getPublicVoiceRoom(room),
+      });
     }
 
     res.json({
@@ -1174,7 +1503,6 @@ app.post("/api/voice-rooms/:roomId/end", authRequired, async (req, res) => {
     res.status(500).json({ error: "Could not end the Voice Room." });
   }
 });
-
 
 /* =========================
    VOICE ROOM MESSAGES
@@ -1200,13 +1528,15 @@ voiceRoomAudioPipeline = createVoiceRoomAudioPipeline({
   getVoiceRoomParticipant,
 });
 
-app.post("/api/voice-rooms/:roomId/message", async (req, res) => {
+const roomMessageRateLimit = createOperationRateLimit({
+  windowMs: 60000,
+  max: 25,
+  message: "Too many messages sent. Please slow down.",
+});
+
+app.post("/api/voice-rooms/:roomId/message", roomMessageRateLimit, async (req, res) => {
   try {
-    const { participantId, message } = req.body;
-    console.log("========== MESSAGE API ==========");
-console.log("Participant:", participantId);
-console.log("Message:", message);
-console.log("=================================");
+    const { participantId, message, roomToken: bodyRoomToken } = req.body || {};
 
     if (!participantId) {
       return res.status(400).json({
@@ -1220,7 +1550,7 @@ console.log("=================================");
       });
     }
 
-    const room = await VoiceRoom.findById(req.params.roomId);
+    const room = await findVoiceRoomByIdOrInvite(req.params.roomId);
 
     if (!room) {
       return res.status(404).json({
@@ -1242,7 +1572,37 @@ console.log("=================================");
       });
     }
 
-    const cleanMessage = message.trim();
+    // Verify sender owns the participantId to prevent identity spoofing
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : bodyRoomToken || null;
+
+    if (!token) {
+      return res.status(401).json({ error: "Authentication required to send message." });
+    }
+
+    let isAuthorized = false;
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      if (decoded.participantId === participantId) {
+        isAuthorized = true;
+      } else if (
+        decoded.userId &&
+        participant.userId &&
+        String(decoded.userId) === String(participant.userId)
+      ) {
+        isAuthorized = true;
+      }
+    } catch {
+      return res.status(401).json({ error: "Invalid message authorization." });
+    }
+
+    if (!isAuthorized) {
+      return res.status(403).json({ error: "Cannot send message as another participant." });
+    }
+
+    const cleanMessage = message.trim().slice(0, 3000);
 
     const userLine = {
       participantId: participant.participantId,
@@ -1259,47 +1619,11 @@ console.log("=================================");
     let assistantLine = null;
 
     if (aiWasCalled) {
-      const recentTranscript = room.transcript
-        .slice(-18)
-        .map((line) => {
-          const speaker =
-            line.speakerType === "assistant"
-              ? "CALLBUDDY AI"
-              : line.speakerName;
-
-          return `${speaker}: ${line.content}`;
-        })
-        .join("\n");
-
-      const completion = await groq.chat.completions.create({
-        model: "llama-3.1-8b-instant",
-        messages: [
-          {
-            role: "system",
-            content: `
-You are CallBuddy AI inside a shared Voice Room.
-
-Rules:
-- Reply because AI Mic is enabled and the latest speech was sent to you.
-- Be friendly, short, and natural.
-- Usually reply in 1 to 3 sentences.
-- You are speaking to a group, so use the person's name when useful.
-- Never pretend you can hear raw audio; you receive only speech transcripts.
-- You were created by Rishi as a college project.
-            `,
-          },
-          {
-            role: "user",
-            content: `Live Voice Room transcript:\n${recentTranscript}`,
-          },
-        ],
-        temperature: 0.7,
-        max_tokens: 150,
+      const reply = await createVoiceRoomAiReply({
+        client: groq,
+        room,
+        currentLine: userLine,
       });
-
-      const reply =
-        completion.choices[0]?.message?.content ||
-        "I heard you, but I could not generate a complete response.";
 
       assistantLine = {
         participantId: null,
@@ -1314,27 +1638,14 @@ Rules:
 
     await room.save();
 
-io.to(`voice-room:${room._id}`).emit("voice-room:updated", {
-  room: getPublicVoiceRoom(room),
-  event: assistantLine ? "ai-replied" : "message-sent",
-});
+    io.to(`voice-room:${room._id}`).emit("voice-room:updated", {
+      room: getPublicVoiceRoom(room),
+      event: assistantLine ? "ai-replied" : "message-sent",
+    });
 
-res.json({
-      userMessage: {
-        participantId: userLine.participantId,
-        speakerName: userLine.speakerName,
-        speakerType: userLine.speakerType,
-        content: userLine.content,
-        createdAt: userLine.createdAt,
-      },
-      assistantMessage: assistantLine
-        ? {
-            speakerName: assistantLine.speakerName,
-            speakerType: assistantLine.speakerType,
-            content: assistantLine.content,
-            createdAt: assistantLine.createdAt,
-          }
-        : null,
+    res.json({
+      userMessage: userLine,
+      assistantMessage: assistantLine,
       aiWasCalled,
       room: getPublicVoiceRoom(room),
     });
@@ -1350,7 +1661,13 @@ res.json({
    CHAT
 ========================= */
 
-app.post("/api/chat", authRequired, async (req, res) => {
+const chatRateLimit = createOperationRateLimit({
+  windowMs: 60000,
+  max: 30,
+  message: "Too many messages sent. Please slow down.",
+});
+
+app.post("/api/chat", authRequired, chatRateLimit, async (req, res) => {
   try {
     const { sessionId, message } = req.body;
 
@@ -1437,7 +1754,13 @@ app.post("/api/chat", authRequired, async (req, res) => {
    CALL PREVIEW
 ========================= */
 
-app.post("/api/call-preview", authRequired, async (req, res) => {
+const callPreviewRateLimit = createOperationRateLimit({
+  windowMs: 60000,
+  max: 10,
+  message: "Call preview generation limit reached. Please slow down.",
+});
+
+app.post("/api/call-preview", authRequired, callPreviewRateLimit, async (req, res) => {
   try {
     const { recipientName, purpose, duration, script } = req.body;
 
@@ -1506,10 +1829,7 @@ Opening script: ${script || "No custom opening script provided."}
   }
 });
 
-
-
-
-    /* =========================
+/* =========================
    VOICE ARCHIVE
 ========================= */
 
@@ -1520,10 +1840,11 @@ app.get("/api/voice-archive", authRequired, async (req, res) => {
       hostUserId: req.userId,
     })
       .sort({ updatedAt: -1 })
-      .select("title hostName status createdAt updatedAt endedAt transcript participants");
+      .select("title hostName status createdAt updatedAt endedAt transcript participants inviteCode");
 
     const archive = rooms.map((room) => ({
       id: room._id.toString(),
+      inviteCode: room.inviteCode || room._id.toString(),
       title: room.title,
       hostName: room.hostName,
       status: room.status,
@@ -1550,10 +1871,12 @@ app.get("/api/voice-archive", authRequired, async (req, res) => {
 /* Host can open one of their archived Voice Rooms */
 app.get("/api/voice-archive/:roomId", authRequired, async (req, res) => {
   try {
-    const room = await VoiceRoom.findOne({
-      _id: req.params.roomId,
-      hostUserId: req.userId,
-    });
+    const isObjectId = mongoose.Types.ObjectId.isValid(req.params.roomId);
+    const query = isObjectId
+      ? { $or: [{ _id: req.params.roomId }, { inviteCode: req.params.roomId }], hostUserId: req.userId }
+      : { inviteCode: req.params.roomId, hostUserId: req.userId };
+
+    const room = await VoiceRoom.findOne(query);
 
     if (!room) {
       return res.status(404).json({
@@ -1570,17 +1893,29 @@ app.get("/api/voice-archive/:roomId", authRequired, async (req, res) => {
     });
   }
 });
-    
-  
+
+if (require.main === module) {
   mongoose
-  .connect(process.env.MONGODB_URI)
-  .then(() => {
-    console.log("✅ MongoDB Connected!");
-    server.listen(PORT, () => {
-      console.log(`CallBuddy AI server running at http://localhost:${PORT}`);
+    .connect(process.env.MONGODB_URI)
+    .then(() => {
+      console.log("✅ MongoDB Connected!");
+      server.listen(PORT, () => {
+        console.log(`CallBuddy AI server running at http://localhost:${PORT}`);
+      });
+    })
+    .catch((err) => {
+      console.dir(err, { depth: null });
+      process.exit(1);
     });
-  })
-  .catch((err) => {
-    console.dir(err, { depth: null });
-    process.exit(1);
-  });
+}
+
+module.exports = {
+  app,
+  server,
+  io,
+  findVoiceRoomByIdOrInvite,
+  createToken,
+  createRoomToken,
+  JWT_SECRET,
+  getPublicVoiceRoom,
+};

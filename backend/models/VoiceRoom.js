@@ -117,6 +117,13 @@ const voiceRoomSchema = new mongoose.Schema(
       type: [transcriptSchema],
       default: [],
     },
+
+    inviteCode: {
+      type: String,
+      unique: true,
+      sparse: true,
+      index: true,
+    },
   },
   {
     timestamps: true,
